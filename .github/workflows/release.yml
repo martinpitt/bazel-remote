@@ -1,0 +1,84 @@
+name: release binaries
+
+# Publishing a release triggers this; the tag input is for adding or replacing an asset on a release
+# that already exists. Either way the tag is checked out explicitly rather than whatever branch this
+# file came from, because GitHub runs a release-triggered workflow from the default branch.
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: tag to build, and the release to attach the binaries to
+        required: true
+
+jobs:
+  binary:
+    name: linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - name: resolve the tag
+        run: echo "TAG=${{ inputs.tag || github.event.release.tag_name }}" >> "$GITHUB_ENV"
+
+      # The build stamps the binary with `git tag --points-at HEAD`, so the tags have to be here.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Dynamically linked, like linux-build.sh.
+      - name: build
+        run: |
+          set -eu
+          commit=$(git rev-parse HEAD)
+          tags=$(git tag --points-at HEAD | sort -h | paste -sd , -)
+          stamp="-X \"main.gitCommit=$commit\" -X \"main.gitTags=$tags\""
+          CGO_ENABLED=1 GOOS=linux GOARCH=${{ matrix.arch }} go build -a \
+              -ldflags "-s -w $stamp" \
+              -o "bazel-remote-${TAG#v}-linux-${{ matrix.arch }}" .
+
+      # The floor an asset imposes on its host, recorded in the log so a bug report can cite it.
+      - name: report the glibc floor
+        run: objdump -T "bazel-remote-${TAG#v}-linux-${{ matrix.arch }}" |
+             grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+
+      # Bug guard (static builds fail): reach a proxy backend by name and check the process is still
+      # alive. The name need not resolve, only be looked up. No credentials, no bucket. The bucket name
+      # does have to be a legal one, because minio-go rejects a short one client-side and then nothing is
+      # ever looked up.
+      - name: check it survives a proxy name lookup
+        run: |
+          set -eu
+          ./"bazel-remote-${TAG#v}-linux-${{ matrix.arch }}" \
+              --dir "$RUNNER_TEMP/cache" --max_size 1 \
+              --http_address 127.0.0.1:8080 --grpc_address none \
+              --s3.endpoint bucket.example.invalid --s3.bucket bucket --s3.region auto \
+              --s3.auth_method access_key --s3.access_key_id k --s3.secret_access_key s &
+          pid=$!
+          until curl -sf -m 2 -o /dev/null http://127.0.0.1:8080/status; do
+              kill -0 $pid
+              sleep 0.5
+          done
+          curl -s -o /dev/null http://127.0.0.1:8080/cas/$(printf '0%.0s' $(seq 64))
+          kill -0 $pid
+          kill $pid
+
+      - name: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "bazel-remote-${TAG#v}-linux-${{ matrix.arch }}" --clobber
