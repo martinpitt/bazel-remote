@@ -1,0 +1,55 @@
+name: release binary
+
+# Publishing a release triggers this; the tag input is for rebuilding an asset for a release that
+# already exists. Either way the tag is checked out explicitly rather than whatever branch this file
+# came from, because GitHub runs a release-triggered workflow from the default branch.
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: tag to build, and the release to attach the binary to
+        required: true
+
+jobs:
+  linux-amd64:
+    name: build and upload the linux amd64 binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: resolve the tag
+        run: echo "TAG=${{ inputs.tag || github.event.release.tag_name }}" >> "$GITHUB_ENV"
+
+      # The build stamps the binary with `git tag --points-at HEAD`, so the tags have to be here.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Statically linked, unlike linux-build.sh, so the asset does not inherit the runner image's
+      # glibc version and runs on distributions older than the runner. libc.a comes from libc6-dev,
+      # which the runner image already has. zstd is cgo, so CGO_ENABLED stays on.
+      - name: build
+        run: |
+          set -eu
+          commit=$(git rev-parse HEAD)
+          tags=$(git tag --points-at HEAD | sort -h | paste -sd , -)
+          stamp="-X \"main.gitCommit=$commit\" -X \"main.gitTags=$tags\""
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -a \
+              -ldflags "-linkmode external -extldflags -static $stamp" \
+              -o "bazel-remote-${TAG#v}-linux-amd64" .
+
+      - name: check it came out static
+        run: file "bazel-remote-${TAG#v}-linux-amd64" | grep -q "statically linked"
+
+      - name: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "bazel-remote-${TAG#v}-linux-amd64" --clobber
